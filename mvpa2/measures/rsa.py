@@ -18,6 +18,7 @@ from mvpa2.base import externals
 from mvpa2.base.param import Parameter
 from mvpa2.base.constraints import EnsureChoice
 from mvpa2.mappers.fx import mean_group_sample
+from mvpa2.measures.corrcoef import pearson_correlation
 
 if externals.exists('scipy', raise_=True):
     from scipy.spatial.distance import pdist, squareform, cdist
@@ -25,7 +26,7 @@ if externals.exists('scipy', raise_=True):
 
 
 class CDist(Measure):
-    """Compute cross-validated dissimiliarity matrix for samples in a dataset
+    """Compute cross-validated dissimilarity matrix for samples in a dataset
 
     This `Measure` can be trained on part of the dataset (for example,
     a partition) and called on another partition. It can be used in
@@ -65,9 +66,9 @@ class CDist(Measure):
     def _call(self, ds):
         test_ds = self._prepare_ds(ds)
         if test_ds.nsamples != self._train_ds.nsamples:
-            raise ValueError('Datasets should have same sample size for dissimilarity, '\
-                             'nsamples for train: %d, test: %d'%(self._train_ds.nsamples,
-                                                                 test_ds.nsamples))
+            raise ValueError('Datasets should have same sample size for dissimilarity, ' \
+                             'nsamples for train: %d, test: %d' % (self._train_ds.nsamples,
+                                                                   test_ds.nsamples))
         # Call actual distance metric
         distds = cdist(self._train_ds.samples, test_ds.samples,
                        metric=self.params.pairwise_metric,
@@ -77,16 +78,80 @@ class CDist(Measure):
         for k in self._train_ds.sa:
             if k in test_ds.sa:
                 sa_dict[k] = list(product(self._train_ds.sa.get(k).value,
-                                                   test_ds.sa.get(k).value))
+                                          test_ds.sa.get(k).value))
 
         distds = Dataset(samples=distds.ravel()[:, None], sa=sa_dict)
         return distds
 
 
-class PDist(Measure):
-    """Compute dissimiliarity matrix for samples in a dataset
+class DiagonalConsistency(Measure):
+    """Compute cross-validated within-condition consistency score for samples in a dataset
 
-    This `Measure` returns the upper triangle of the n x n disimilarity matrix
+    This `Measure` can be trained on part of the dataset (for example,
+    a partition) and called on another partition. It can be used to compute consistency of
+    within vs. between condition representations, as described in [1]_.
+    Returns a single consistency value.
+
+    References
+    ----------
+    .. [1] Harel, A., Kravitz, D. J., & Baker, C. I. (2013). Deconstructing Visual Scenes in
+     Cortex: Gradients of Object and Spatial Layout Information. Cerebral Cortex, 23(4), 947--957.
+    """
+    consistency_metric = Parameter('pearson',
+                                   constraints=EnsureChoice('pearson',
+                                                            'spearman'),
+            doc="""Correlation measure to use for the correlation between conditions.""")
+
+    center_data = Parameter(False, constraints='bool',
+            doc="""If True then center each column of the data matrix by subtracting the
+            column mean from each element. This is recommended especially when
+            using pairwise_metric='correlation'.""")
+
+    sattr = Parameter(['targets'],
+            doc="""List of sample attributes whose unique values will be used to
+            identify the samples groups. Typically your category labels or targets.""")
+
+    def __init__(self, **kwargs):
+        Measure.__init__(self, **kwargs)
+        self._train_ds = None
+
+    def _make_data(self, ds):
+        if self.params.sattr is not None:
+            mgs = mean_group_sample(attrs=self.params.sattr)
+            ds = mgs(ds)
+        data = ds.samples
+        if self.params.center_data:
+            data = data - np.mean(data, 0)
+        if self.params.consistency_metric == 'spearman':
+            data = rankdata(data)
+        return data
+
+    def _train(self, ds):
+        self._train_data = self._make_data(ds)
+        self.is_trained = True
+
+    def _call(self, ds):
+        test_data = self._make_data(ds)
+        if test_data.shape != self._train_data.shape:
+            raise ValueError('Datasets should have same sample size for dissimilarity.')
+
+        # get correlation matrix, fix NaNs
+        corrmat = np.nan_to_num(pearson_correlation(self._train_data, test_data))
+
+        # ugly but fast computation of diagonal mean minus off-diagonal mean
+        dim = corrmat.shape[0]
+        off_diag_n = dim * (dim - 1)
+        diag_sum = np.sum(np.diag(corrmat))
+        off_diag_sum = np.sum(corrmat) - diag_sum
+        diff = (diag_sum / dim) - (off_diag_sum / off_diag_n)
+
+        return Dataset(np.array([diff]), sa={'metrics': ['diagonalconsistency']})
+
+
+class PDist(Measure):
+    """Compute dissimilarity matrix for samples in a dataset
+
+    This `Measure` returns the upper triangle of the n x n dissimilarity matrix
     defined as the pairwise distances between samples in the dataset, and where
     n is the number of samples.
     """
@@ -293,6 +358,93 @@ class PDistTargetSimilarity(Measure):
             return Dataset([[rho, p]], fa={'metrics': ['rho', 'p']})
 
 
+class PDistPartialCorrelation(Measure):
+    """Calculate the partial correlations of PDist measures with a target
+
+    Target dissimilarity correlation `Measure`. Computes the partial
+    correlation between the dissimilarity matrix defined over the pairwise
+    distances between the samples of dataset and the target dissimilarity
+    matrix, correcting for a third dissimilarity matrix, as described in [2]_.
+
+    References
+    ----------
+    .. [2] Clarke, A., & Tyler, L. K. (2014). Object-Specific Semantic Coding in
+     Human Perirhinal Cortex. The Journal of Neuroscience, 34(14), 4766--4775.
+    """
+
+    is_trained = True
+    """Indicate that this measure is always trained."""
+
+    pairwise_metric = Parameter('correlation', constraints='str', doc="""\
+          Distance metric to use for calculating pairwise vector distances for
+          dissimilarity matrix (DSM).  See scipy.spatial.distance.pdist for
+          all possible metrics.""")
+
+    comparison_metric = Parameter('pearson',
+                                  constraints=EnsureChoice('pearson',
+                                                           'spearman'),
+                                  doc="""\
+          Similarity measure to be used for comparing dataset DSM with the
+          target DSM and control DSM.""")
+
+    center_data = Parameter(False, constraints='bool', doc="""\
+          If True then center each column of the data matrix by subtracting the
+          column mean from each element. This is recommended especially when
+          using pairwise_metric='correlation'.""")
+
+    def __init__(self, target_dsm, control_dsm, **kwargs):
+        """
+        Parameters
+        ----------
+        target_dsm : array (length N*(N-1)/2)
+          Target dissimilarity matrix
+
+        control_dsm : array (length N*(N-1)/2)
+          Control dissimilarity matrix
+
+        Returns
+        -------
+        Dataset
+          Contains one feature: the correlation coefficient (rho)
+        """
+        # init base classes first
+        super(PDistPartialCorrelation, self).__init__(**kwargs)
+        self.target_dsm = target_dsm
+        self.control_dsm = control_dsm
+        if self.params.comparison_metric == 'spearman':
+            self.target_dsm = rankdata(target_dsm)
+            self.control_dsm = rankdata(control_dsm)
+
+    def _call(self, dataset):
+
+        data = dataset.samples
+        if self.params.center_data:
+            data = data - np.mean(data, 0)
+        dsm = pdist(data, self.params.pairwise_metric)
+        if self.params.comparison_metric == 'spearman':
+            dsm = rankdata(dsm)
+
+        dsm = dsm.reshape(-1, 1)
+        target_dsm = self.target_dsm.reshape(-1, 1)
+
+        # add a column of ones to control DSM for the regression intercept
+        size = self.control_dsm.reshape(-1, 1).shape
+        control_dsm = np.ones((size[0], size[1] + 1))
+        control_dsm[:, 0] = self.control_dsm
+
+        def residualize(x, z):
+            # fit linear model and return residuals
+            return x - z.dot(np.linalg.lstsq(z, x, rcond=-1)[0])
+
+        # residualize both DSM and target DSM for control DSM
+        dsm_residuals = residualize(dsm, control_dsm)
+        target_dsm_residuals = residualize(target_dsm, control_dsm)
+
+        # return correlation of the residuals
+        rho, _ = pearsonr(dsm_residuals, target_dsm_residuals)
+        return Dataset([rho], fa={'metrics': ['rho']})
+
+
 class Regression(Measure):
     """
     Given a dataset, compute regularized regression (Ridge or Lasso) on the
@@ -329,9 +481,8 @@ class Regression(Measure):
                                                         'predictor dsms before running the regression model')
 
     normalize = Parameter(False, constraints='bool', doc='if True the predictors and neural dsm will be'
-                                                        'normalized (z-scored) prior to the regression (and after '
-                                                        'the data ranking, if rank_data=True)')
-
+                                                         'normalized (z-scored) prior to the regression (and after '
+                                                         'the data ranking, if rank_data=True)')
 
     def __init__(self, predictors, keep_pairs=None, **kwargs):
         """
